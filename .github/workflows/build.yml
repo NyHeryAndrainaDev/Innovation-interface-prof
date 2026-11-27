@@ -1,0 +1,446 @@
+name: Build APK Android
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Décompresser le zip si le projet est envoyé en .zip
+        run: |
+          echo "=== Contenu du dépôt ==="
+          find . -maxdepth 3 -not -path "./.git/*" | sort
+          if [ ! -f package.json ]; then
+            ZIP=$(find . -maxdepth 3 -iname "*.zip" -not -path "./.git/*" | head -n 1 || true)
+            if [ -z "$ZIP" ]; then
+              echo "ERREUR : aucun package.json ni fichier .zip dans le dépôt"
+              exit 1
+            fi
+            echo "Extraction de $ZIP"
+            unzip -q -o "$ZIP" -d . || true
+          fi
+          if [ ! -f package.json ]; then
+            PKG=$(find . -maxdepth 4 -name package.json -not -path "*/node_modules/*" | head -n 1 || true)
+            if [ -z "$PKG" ]; then echo "ERREUR : package.json introuvable après extraction"; exit 1; fi
+            DIR=$(dirname "$PKG")
+            echo "Projet trouvé dans $DIR"
+            cp -a "$DIR"/. .
+          fi
+          echo "=== Racine du projet ==="
+          ls -la
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Installer Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Installer les dépendances
+        run: npm install
+
+      - name: Installer les plugins de notifications
+        run: npm install "@capacitor/local-notifications@^6.0.0" "@capacitor/preferences@^6.0.0"
+
+      - name: Vérifier les fichiers web du projet
+        run: |
+          set -e
+          for F in index.html app.js style.css icons.js notifications.js manifest.json icon.png; do
+            if [ ! -f "www/$F" ]; then echo "ERREUR : www/$F introuvable"; exit 1; fi
+          done
+          grep -q "sync-presence" www/app.js || { echo "ERREUR : www/app.js n'est pas la version avec la présence"; exit 1; }
+          echo "Fichiers web OK"
+
+      - name: Ajouter la plateforme Android
+        run: npx cap add android
+
+      - name: Numéro de version de l'application
+        run: |
+          set -e
+          GRADLE=android/app/build.gradle
+          sed -i -E 's/versionCode [0-9]+/versionCode 7/; s/versionName "[^"]*"/versionName "7.0"/' "$GRADLE"
+          grep -n "versionCode\|versionName" "$GRADLE" || true
+
+      - name: Générer l'icône et le splash
+        run: npx capacitor-assets generate --android
+
+      - name: Synchroniser les fichiers web
+        run: npx cap sync android
+
+      - name: Autoriser le trafic HTTP (serveur local du PC)
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          if ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
+            sed -i 's/<application/<application android:usesCleartextTraffic="true"/' "$MANIFEST"
+          fi
+          grep -n "usesCleartextTraffic" "$MANIFEST"
+
+      - name: Ajouter le code natif des notifications
+        run: |
+          set -e
+          PKG_DIR=android/app/src/main/java/com/sekolify/prof
+          if [ ! -f "$PKG_DIR/MainActivity.java" ]; then
+            echo "ERREUR : MainActivity.java introuvable"
+            find android/app/src/main/java -name "*.java"
+            exit 1
+          fi
+
+          cat > "$PKG_DIR/MainActivity.java" <<'JAVA_MAIN'
+          package com.sekolify.prof;
+
+          import android.os.Bundle;
+
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  try {
+                      SyncWatcher.createChannels(this);   // canaux de notification (son d'alarme)
+                      SyncWatcher.schedule(this);         // surveillance du PC en arrière-plan (~15 min)
+                  } catch (Throwable ignored) {
+                      // ne jamais empêcher l'app de démarrer
+                  }
+              }
+          }
+          JAVA_MAIN
+
+          cat > "$PKG_DIR/SyncWatcher.java" <<'JAVA_SYNC'
+          package com.sekolify.prof;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.media.AudioAttributes;
+          import android.media.AudioManager;
+          import android.net.Uri;
+          import android.os.Build;
+
+          import androidx.annotation.NonNull;
+          import androidx.core.app.NotificationCompat;
+          import androidx.work.ExistingPeriodicWorkPolicy;
+          import androidx.work.PeriodicWorkRequest;
+          import androidx.work.WorkManager;
+          import androidx.work.Worker;
+          import androidx.work.WorkerParameters;
+
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.concurrent.TimeUnit;
+
+          /**
+           * Surveille le PC de l'école en arrière-plan (même app fermée).
+           * Toutes les ~15 min : s'il reste des notes non envoyées ET que le PC répond,
+           * une notification sonore invite le prof à synchroniser (une seule fois par épisode).
+           *
+           * L'état (IP du PC, nombre de notes en attente) est écrit par l'app web dans
+           * les SharedPreferences "CapacitorStorage" via le plugin @capacitor/preferences.
+           */
+          public class SyncWatcher extends Worker {
+
+              static final String CH_COURS = "cours_v1";
+              static final String CH_SYNC = "sync_v1";
+              private static final String WORK_NAME = "sekolify_sync_watch";
+              private static final String PREFS = "CapacitorStorage";
+              private static final int NOTIF_SYNC_ID = 9001;
+
+              public SyncWatcher(@NonNull Context context, @NonNull WorkerParameters params) {
+                  super(context, params);
+              }
+
+              // ---------------------------------------------------------------- canaux
+
+              static void createChannels(Context ctx) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+                  NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+
+                  Uri sound = soundUri(ctx);
+                  AudioAttributes attrs = new AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_ALARM)                  // son « imposé » : volume alarme
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                          .build();
+
+                  makeChannel(nm, CH_COURS, "Rappels de cours", "Rappel 10 minutes avant chaque cours", sound, attrs);
+                  makeChannel(nm, CH_SYNC, "Synchronisation des notes", "Alerte quand le PC de l'école est joignable", sound, attrs);
+              }
+
+              private static void makeChannel(NotificationManager nm, String id, String name, String desc,
+                                              Uri sound, AudioAttributes attrs) {
+                  NotificationChannel c = new NotificationChannel(id, name, NotificationManager.IMPORTANCE_HIGH);
+                  c.setDescription(desc);
+                  c.setSound(sound, attrs);
+                  c.enableVibration(true);
+                  c.setVibrationPattern(new long[]{0, 500, 250, 500, 250, 800});
+                  c.enableLights(true);
+                  c.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                  nm.createNotificationChannel(c);
+              }
+
+              private static Uri soundUri(Context ctx) {
+                  return Uri.parse("android.resource://" + ctx.getPackageName() + "/raw/alerte");
+              }
+
+              // ---------------------------------------------------------- planification
+
+              static void schedule(Context ctx) {
+                  // Pas de contrainte réseau volontairement : un Wi-Fi local sans internet
+                  // n'est pas « validé » par Android et bloquerait la tâche.
+                  PeriodicWorkRequest req = new PeriodicWorkRequest.Builder(SyncWatcher.class, 15, TimeUnit.MINUTES).build();
+                  WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, req);
+              }
+
+              // ----------------------------------------------------------------- travail
+
+              @NonNull
+              @Override
+              public Result doWork() {
+                  try {
+                      Context ctx = getApplicationContext();
+                      SharedPreferences sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+
+                      int pending = toInt(sp.getString("bg_pending", "0"), 0);
+                      String ip = sp.getString("bg_ip", "");
+                      int port = toInt(sp.getString("bg_port", "47831"), 47831);
+                      boolean last = "1".equals(sp.getString("bg_last_reachable", "0"));
+
+                      if (pending <= 0 || ip == null || ip.isEmpty()) {
+                          if (last) sp.edit().putString("bg_last_reachable", "0").apply();   // nouvel épisode au prochain ajout de notes
+                          return Result.success();
+                      }
+
+                      boolean reachable = probe(ip, port);
+                      if (reachable && !last) notifySync(ctx, pending);
+                      if (reachable != last) sp.edit().putString("bg_last_reachable", reachable ? "1" : "0").apply();
+                  } catch (Throwable ignored) {
+                      // on réessaiera au prochain passage
+                  }
+                  return Result.success();
+              }
+
+              private static int toInt(String s, int def) {
+                  try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; }
+              }
+
+              private static boolean probe(String ip, int port) {
+                  HttpURLConnection c = null;
+                  try {
+                      c = (HttpURLConnection) new URL("http://" + ip + ":" + port + "/hello").openConnection();
+                      c.setConnectTimeout(2500);
+                      c.setReadTimeout(2500);
+                      c.setRequestMethod("GET");
+                      if (c.getResponseCode() != 200) return false;
+                      BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
+                      StringBuilder sb = new StringBuilder();
+                      String line;
+                      while ((line = r.readLine()) != null && sb.length() < 2000) sb.append(line);
+                      r.close();
+                      return sb.toString().contains("sekolify");
+                  } catch (Exception e) {
+                      return false;
+                  } finally {
+                      if (c != null) c.disconnect();
+                  }
+              }
+
+              private static void notifySync(Context ctx, int pending) {
+                  createChannels(ctx);
+                  NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+
+                  Intent open = new Intent(ctx, MainActivity.class);
+                  open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(ctx, 0, open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+                  String text = pending + " élément(s) non envoyé(s) (notes ou appels). Il est temps de synchroniser avec le PC de l'école.";
+                  NotificationCompat.Builder b = new NotificationCompat.Builder(ctx, CH_SYNC)
+                          .setSmallIcon(R.drawable.ic_stat_notify)
+                          .setContentTitle("Connecté au serveur de l'école")
+                          .setContentText(text)
+                          .setStyle(new NotificationCompat.BigTextStyle().bigText(text))
+                          .setPriority(NotificationCompat.PRIORITY_HIGH)
+                          .setCategory(NotificationCompat.CATEGORY_REMINDER)
+                          .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                          .setAutoCancel(true)
+                          .setContentIntent(pi);
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {          // avant Android 8 : pas de canaux
+                      b.setSound(soundUri(ctx), AudioManager.STREAM_ALARM);
+                      b.setVibrate(new long[]{0, 500, 250, 500, 250, 800});
+                  }
+                  nm.notify(NOTIF_SYNC_ID, b.build());
+              }
+          }
+          JAVA_SYNC
+
+          mkdir -p android/app/src/main/res/raw android/app/src/main/res/drawable
+          cat > android/app/src/main/res/drawable/ic_stat_notify.xml <<'XML_ICON'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:pathData="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="2"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:fillColor="#00000000"/>
+              <path
+                  android:pathData="M10.3 21a1.94 1.94 0 0 0 3.4 0"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="2"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:fillColor="#00000000"/>
+          </vector>
+          XML_ICON
+          python3 - <<'PY'
+          import wave, struct, math
+          sr = 22050
+          def tone(freq, dur, vol=0.9, decay=3.0):
+              n = int(sr * dur); out = []
+              for i in range(n):
+                  t = i / sr
+                  env = min(1, i / (sr * 0.005)) * math.exp(-decay * t / dur * 1.5)
+                  v = math.sin(2*math.pi*freq*t) + 0.45*math.sin(2*math.pi*freq*2*t) + 0.2*math.sin(2*math.pi*freq*3*t)
+                  out.append(vol * env * v / 1.65)
+              return out
+          def silence(d): return [0.0] * int(sr * d)
+          seq = []
+          for k in range(3):
+              seq += tone(880, 0.38) + tone(1318.5, 0.38) + tone(1760, 0.55) + silence(0.35)
+          w = wave.open("android/app/src/main/res/raw/alerte.wav", "wb")
+          w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+          w.writeframes(b"".join(struct.pack("<h", int(max(-1, min(1, x)) * 32000)) for x in seq))
+          w.close()
+          PY
+          ls -la android/app/src/main/res/raw
+
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          for P in POST_NOTIFICATIONS SCHEDULE_EXACT_ALARM VIBRATE RECEIVE_BOOT_COMPLETED WAKE_LOCK; do
+            if ! grep -q "android.permission.$P\"" "$MANIFEST"; then
+              sed -i "s#</manifest>#    <uses-permission android:name=\"android.permission.$P\" />\n</manifest>#" "$MANIFEST"
+            fi
+          done
+          grep -n "uses-permission" "$MANIFEST"
+
+          cat >> android/app/build.gradle <<'GRADLE'
+
+          dependencies {
+              implementation "androidx.work:work-runtime:2.9.0"
+          }
+          android {
+              lint {
+                  abortOnError false
+                  checkReleaseBuilds false
+              }
+          }
+          GRADLE
+          tail -n 14 android/app/build.gradle
+
+      - name: Configurer la signature avec le keystore
+        run: |
+          KS="$RUNNER_TEMP/sekolify-prof.jks"
+          base64 -d > "$KS" <<'B64'
+          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
+          c5MElLjC
+          B64
+          echo "Keystore reconstruit :"
+          ls -la "$KS"
+          keytool -list -keystore "$KS" -storepass sekolify2026 | grep -E "entry|Entry"
+          cat >> android/app/build.gradle <<EOF
+
+          android {
+              signingConfigs {
+                  release {
+                      storeFile file("$KS")
+                      storePassword "sekolify2026"
+                      keyAlias "sekolify"
+                      keyPassword "sekolify2026"
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                  }
+              }
+          }
+          EOF
+          tail -n 20 android/app/build.gradle
+
+      - name: Compiler l'APK (release signé)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Vérifier la signature
+        run: |
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          ls -la "$APK"
+          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK" | head -n 5
+
+      - name: Publier l'APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sekolify-Prof-APK
+          path: android/app/build/outputs/apk/release/app-release.apk
